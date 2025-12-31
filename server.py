@@ -27,7 +27,11 @@ from fastapi import (
     UploadFile,
     Form,
     BackgroundTasks,
+    WebSocket,
+    WebSocketDisconnect,
 )
+import json
+import base64
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -1329,6 +1333,121 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/stream")
+async def websocket_stream_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time TTS streaming, compatible with ResembleAITTSService.
+    """
+    await websocket.accept()
+    logger.info("WebSocket connection established on /stream")
+    
+    try:
+        while True:
+            # Receive message from client
+            message_text = await websocket.receive_text()
+            try:
+                msg = json.loads(message_text)
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON received on WebSocket: {message_text}")
+                continue
+
+            text = msg.get("data", "").strip()
+            voice_id = msg.get("voice_uuid", "")
+            request_id = msg.get("request_id", "")
+            requested_sample_rate = msg.get("sample_rate", 22050)
+
+            if not text:
+                # Still send an end marker if we receive an empty message but have a request_id
+                if request_id:
+                    await websocket.send_json({"type": "audio_end", "request_id": request_id})
+                continue
+
+            logger.info(f"WebSocket TTS request: '{text}' (voice: {voice_id}, request_id: {request_id})")
+
+            # Resolve voice path (same logic as other endpoints)
+            predefined_voices_path = get_predefined_voices_path(ensure_absolute=True)
+            reference_audio_path = get_reference_audio_path(ensure_absolute=True)
+            
+            # Attempt to find the voice file
+            voice_file = voice_id if voice_id.endswith((".wav", ".mp3")) else f"{voice_id}.wav"
+            voice_path = predefined_voices_path / voice_file
+            if not voice_path.is_file():
+                voice_path = reference_audio_path / voice_file
+            
+            if not voice_path.is_file():
+                # Fallback to default voice if not found
+                default_voice = config_manager.get_string("tts_engine.default_voice_id", "Emily.wav")
+                voice_path = predefined_voices_path / default_voice
+                logger.warning(f"Voice '{voice_id}' not found, falling back to '{default_voice}'")
+
+            if not engine.MODEL_LOADED:
+                error_msg = {"type": "error", "message": "Model not loaded", "request_id": request_id}
+                await websocket.send_json(error_msg)
+                continue
+
+            try:
+                # 1. Synthesize
+                audio_tensor, sr = engine.synthesize(
+                    text=text,
+                    audio_prompt_path=str(voice_path),
+                    temperature=get_gen_default_temperature(),
+                    exaggeration=get_gen_default_exaggeration(),
+                    cfg_weight=get_gen_default_cfg_weight(),
+                    seed=get_gen_default_seed(),
+                )
+
+                if audio_tensor is None:
+                    raise Exception("Synthesis failed to produce audio tensor")
+
+                # 2. Resample if necessary
+                if sr != requested_sample_rate:
+                    # Just to get numpy/resample logic if needed? 
+                    # Actually utils.encode_audio handles resampling. 
+                    # But we want RAW PCM16 for ResembleAITTSService.
+                    
+                    audio_np = audio_tensor.cpu().numpy()
+                    if audio_np.ndim == 2:
+                        audio_np = audio_np.squeeze()
+                    
+                    import librosa
+                    audio_resampled = librosa.resample(audio_np, orig_sr=sr, target_sr=requested_sample_rate)
+                    audio_np = audio_resampled
+                    sr = requested_sample_rate
+                else:
+                    audio_np = audio_tensor.cpu().numpy()
+                    if audio_np.ndim == 2:
+                        audio_np = audio_np.squeeze()
+
+                # 3. Convert to PCM16
+                audio_int16 = (audio_np * 32767).astype(np.int16)
+                audio_base64 = base64.b64encode(audio_int16.tobytes()).decode("utf-8")
+                
+                # 5. Send audio chunk
+                chunk_msg = {
+                    "type": "audio",
+                    "audio_content": audio_base64,
+                    "request_id": request_id,
+                }
+                await websocket.send_json(chunk_msg)
+
+                # 6. Send end marker
+                end_msg = {"type": "audio_end", "request_id": request_id}
+                await websocket.send_json(end_msg)
+
+            except Exception as e_gen:
+                logger.error(f"Error during WebSocket synthesis: {e_gen}", exc_info=True)
+                await websocket.send_json({
+                    "type": "error",
+                    "message": str(e_gen),
+                    "request_id": request_id
+                })
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e_ws:
+        logger.error(f"Unexpected WebSocket error: {e_ws}", exc_info=True)
 
 
 # --- Main Execution ---
