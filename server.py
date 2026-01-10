@@ -408,6 +408,60 @@ async def get_web_ui(request: Request):
         )
 
 
+# --- Health Check Endpoint (Spec Section 2.3) ---
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """
+    Returns service health status for orchestration.
+
+    Spec Section 2.3 - Chatterbox Readiness Contract:
+    - HTTP server listening on port 8004
+    - TTS model loaded and can synthesize audio
+
+    Returns:
+        - status: ready | not_ready | loading
+        - model_loaded: boolean
+        - device: cuda | cpu
+    """
+    import torch
+
+    model_loaded = engine.MODEL_LOADED
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if not startup_complete_event.is_set():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "loading",
+                "reason": "Server starting up",
+                "model_loaded": False,
+                "device": device,
+            }
+        )
+
+    if not model_loaded:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": "TTS model not loaded",
+                "model_loaded": False,
+                "device": device,
+            }
+        )
+
+    # Get model info for detailed health response
+    model_info = engine.get_model_info()
+
+    return {
+        "status": "ready",
+        "model_loaded": True,
+        "device": device,
+        "model": model_info.get("class_name", "unknown"),
+        "version": "2.0.2",
+    }
+
+
 # --- API Endpoint for Model Information ---
 @app.get("/api/model-info", tags=["Model Information"])
 async def get_model_info_endpoint():
